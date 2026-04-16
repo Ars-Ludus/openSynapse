@@ -265,7 +265,57 @@ FROM edges WHERE source_snippet_id = ? OR target_snippet_id = ?`,
 		return nil, err
 	}
 	defer rows.Close()
+	return scanEdges(rows)
+}
 
+// GetDependencies returns outgoing edges — what this snippet calls or references.
+func (d *DB) GetDependencies(ctx context.Context, snippetID uuid.UUID) ([]*models.Edge, error) {
+	rows, err := d.sql.QueryContext(ctx, `
+SELECT edge_id, source_snippet_id, target_snippet_id, edge_type, merged_context
+FROM edges WHERE source_snippet_id = ?`, snippetID.String())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanEdges(rows)
+}
+
+// GetDependents returns incoming edges — what calls or references this snippet.
+func (d *DB) GetDependents(ctx context.Context, snippetID uuid.UUID) ([]*models.Edge, error) {
+	rows, err := d.sql.QueryContext(ctx, `
+SELECT edge_id, source_snippet_id, target_snippet_id, edge_type, merged_context
+FROM edges WHERE target_snippet_id = ?`, snippetID.String())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanEdges(rows)
+}
+
+// GetSnippetByID returns a single snippet by primary key, or nil if not found.
+func (d *DB) GetSnippetByID(ctx context.Context, id uuid.UUID) (*models.Snippet, error) {
+	row := d.sql.QueryRowContext(ctx, `
+SELECT snippet_id, file_id, snippet_type, name, line_start, line_end, raw_content, description, wikilinks
+FROM snippets WHERE snippet_id = ?`, id.String())
+
+	s := &models.Snippet{}
+	var sidStr, fidStr, st, wikilinks string
+	err := row.Scan(&sidStr, &fidStr, &st, &s.Name,
+		&s.LineStart, &s.LineEnd, &s.RawContent, &s.Description, &wikilinks)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	s.SnippetID, _ = uuid.Parse(sidStr)
+	s.FileID, _ = uuid.Parse(fidStr)
+	s.SnippetType = models.SnippetType(st)
+	s.Wikilinks = unmarshalStrings(wikilinks)
+	return s, nil
+}
+
+func scanEdges(rows *sql.Rows) ([]*models.Edge, error) {
 	var edges []*models.Edge
 	for rows.Next() {
 		e := &models.Edge{}

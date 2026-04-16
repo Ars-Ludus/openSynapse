@@ -6,6 +6,12 @@ Unlike traditional documentation tools that produce static text or RAG systems t
 
 openSynapse (`oSyn`) crawls source files, extracts top-level code units (functions, methods, structs, classes) as **Snippets** using Tree-sitter, resolves cross-file import relationships as **Edges**, enriches each snippet with an LLM-generated description, and stores 768-dimensional semantic embeddings for vector search — all in a self-contained SQLite database.
 
+The knowledge graph is exposed through three surfaces that share a single implementation:
+
+- **CLI** — human-readable search and JSON query commands
+- **HTTP API** — REST endpoints for programmatic access
+- **MCP server** — stdio JSON-RPC for direct AI agent integration (Claude Code, Claude Desktop)
+
 ```
 Source files
     │
@@ -20,6 +26,9 @@ Source files
     │
     ▼
 SQLite + vec_distance_cosine  →  Semantic search
+    │
+    ▼
+service layer  →  HTTP API · MCP tools · CLI query commands
 ```
 
 ## Stack
@@ -33,7 +42,8 @@ SQLite + vec_distance_cosine  →  Semantic search
 | LLM enrichment | Any OpenAI-compatible endpoint | Tested with llama.cpp |
 | Embeddings | CodeRankEmbed (ONNX) | 768-dim, NomicBERT, top-20 MTEB, CPU-friendly |
 | File watching | fsnotify | 500 ms debounce for incremental re-indexing |
-| CLI | Cobra | `index`, `watch`, `search`, `migrate` |
+| MCP server | `mark3labs/mcp-go` | stdio JSON-RPC; 6 tools for AI agent integration |
+| CLI | Cobra | `index`, `watch`, `search`, `migrate`, `serve`, `serve-mcp`, `query` |
 
 ## Quick Start
 
@@ -58,7 +68,7 @@ export LOCAL_LLM_URL=http://192.168.1.1:8080/v1
 export LOCAL_LLM_MODEL=local-model
 ```
 
-### 3. Build and run
+### 3. Build and index
 
 ```bash
 go build -o oSyn ./cmd/oSyn/
@@ -67,6 +77,50 @@ go build -o oSyn ./cmd/oSyn/
 ./oSyn search "how does authentication work"
 ./oSyn watch --path /path/to/your/repo   # live, incremental updates
 ```
+
+### 4. Query the graph directly
+
+```bash
+# JSON output — pipe to jq for filtering
+./oSyn query files
+./oSyn query file --path internal/db/queries.go
+./oSyn query snippet --id <uuid>
+./oSyn query blast-radius --id <uuid>   # who breaks if I change this?
+./oSyn query deps --id <uuid>           # what does this call?
+```
+
+### 5. Start the HTTP API
+
+```bash
+./oSyn serve --port 8080
+curl http://localhost:8080/health
+curl -X POST http://localhost:8080/search \
+     -H 'Content-Type: application/json' \
+     -d '{"query":"pipeline orchestration","limit":5}'
+```
+
+### 6. Connect to Claude via MCP
+
+Add to your Claude Code MCP configuration (`.claude.json` or settings):
+
+```json
+{
+  "mcpServers": {
+    "openSynapse": {
+      "command": "/path/to/oSyn",
+      "args": ["serve-mcp"],
+      "env": {
+        "DATABASE_PATH": "/path/to/opensynapse.db",
+        "EMBED_PROVIDER": "local",
+        "LOCAL_EMBED_URL": "http://127.0.0.1:8765",
+        "EMBED_DIMENSION": "768"
+      }
+    }
+  }
+}
+```
+
+Claude will have access to six tools: `list_files`, `describe_file`, `get_snippet`, `get_blast_radius`, `search`, `get_dependencies`.
 
 ## Supported Languages
 
@@ -89,4 +143,4 @@ Additional languages can be added by registering their Tree-sitter grammar in `i
 
 ## Architecture
 
-See [DOCUMENTATION.md](DOCUMENTATION.md) for full command reference, architecture details, and extension guide.
+See [DOCUMENTATION.md](DOCUMENTATION.md) for full command reference, HTTP API endpoints, MCP tool definitions, architecture details, and extension guide.
