@@ -27,6 +27,14 @@ go.work.sum
 # env file
 .env
 
+# Runtime artifacts
+*.db
+*.db-wal
+*.db-shm
+
+# Local embedding model (large ONNX file — run sidecar from this directory)
+internal/vect-embed/
+
 # Editor/IDE
 # .idea/
 # .vscode/
