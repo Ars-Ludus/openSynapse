@@ -36,6 +36,7 @@ func rootCmd() *cobra.Command {
 		indexCmd(),
 		watchCmd(),
 		searchCmd(),
+		enrichCmd(),
 		migrateCmd(),
 		serveCmd(),
 		serveMcpCmd(),
@@ -83,6 +84,26 @@ func indexCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVarP(&path, "path", "p", ".", "Root directory to index")
+	return cmd
+}
+
+// ── enrich ────────────────────────────────────────────────────────────────────
+
+func enrichCmd() *cobra.Command {
+	var force bool
+	cmd := &cobra.Command{
+		Use:   "enrich",
+		Short: "Generate LLM descriptions for files and snippets that are missing them",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			svc, cleanup, err := buildService(cmd.Context())
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+			return svc.Pipeline.Enrich(cmd.Context(), force)
+		},
+	}
+	cmd.Flags().BoolVar(&force, "force", false, "Re-enrich even if descriptions already exist")
 	return cmd
 }
 

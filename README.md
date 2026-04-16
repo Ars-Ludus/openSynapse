@@ -144,3 +144,6 @@ Additional languages can be added by registering their Tree-sitter grammar in `i
 ## Architecture
 
 See [DOCUMENTATION.md](DOCUMENTATION.md) for full command reference, HTTP API endpoints, MCP tool definitions, architecture details, and extension guide.
+
+--NOTES--
+You will need a local embedding model for the search function to work. I used CodeRankReview 160M Q8 ONNX. I am formulating a plan on how to automate it's deployment for those who wish to use it, while providing proper attribution.

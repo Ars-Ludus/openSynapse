@@ -8,6 +8,7 @@ import (
 	"context"
 	"log"
 	"os"
+	"strings"
 	"sync"
 
 	"opensynapse/internal/crawler"
@@ -191,6 +192,100 @@ func (p *Pipeline) enrich(ctx context.Context, codeFile *models.CodeFile, snippe
 			}
 		}
 	}
+}
+
+// Enrich iterates over all already-indexed files and fills in missing LLM
+// descriptions without re-parsing or re-embedding. Pass force=true to
+// overwrite descriptions that already exist.
+func (p *Pipeline) Enrich(ctx context.Context, force bool) error {
+	files, err := p.db.ListFiles(ctx)
+	if err != nil {
+		return err
+	}
+	log.Printf("enrich: %d files to process", len(files))
+
+	var (
+		wg           sync.WaitGroup
+		filesEnriched int
+		snipsEnriched int
+		mu           sync.Mutex
+	)
+
+	for _, f := range files {
+		f := f
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-p.sem
+			defer func() { p.sem <- struct{}{} }()
+
+			snippets, err := p.db.GetSnippetsByFile(ctx, f.FileID)
+			if err != nil {
+				log.Printf("enrich: get snippets for %s: %v", f.Path, err)
+				return
+			}
+
+			// File summary.
+			if force || f.FileSummary == "" {
+				names := make([]string, 0, len(snippets))
+				for _, s := range snippets {
+					if s.Name != "" {
+						names = append(names, s.Name)
+					}
+				}
+				log.Printf("enrich: [file] requesting summary — %s", f.Path)
+				summary, err := p.llm.SummariseFile(ctx, f, names)
+				if err != nil {
+					log.Printf("enrich: [file] ERROR — %s: %v", f.Path, err)
+				} else if summary == "" {
+					log.Printf("enrich: [file] EMPTY response — %s", f.Path)
+				} else {
+					words := len(strings.Fields(summary))
+					if err := p.db.UpdateFileSummary(ctx, f.FileID, summary); err != nil {
+						log.Printf("enrich: [file] db error — %s: %v", f.Path, err)
+					} else {
+						mu.Lock()
+						filesEnriched++
+						mu.Unlock()
+						log.Printf("enrich: [file] OK (%d words) — %s", words, f.Path)
+					}
+				}
+			} else {
+				log.Printf("enrich: [file] SKIP (already summarised) — %s", f.Path)
+			}
+
+			// Per-snippet descriptions.
+			for _, s := range snippets {
+				if !force && s.Description != "" {
+					log.Printf("enrich: [snippet] SKIP (already described) — %s:%s", f.Path, s.Name)
+					continue
+				}
+				log.Printf("enrich: [snippet] requesting description — %s:%s (lines %d-%d)", f.Path, s.Name, s.LineStart, s.LineEnd)
+				desc, err := p.llm.SummariseSnippet(ctx, s, f.Path)
+				if err != nil {
+					log.Printf("enrich: [snippet] ERROR — %s:%s: %v", f.Path, s.Name, err)
+					continue
+				}
+				if desc == "" {
+					log.Printf("enrich: [snippet] EMPTY response — %s:%s", f.Path, s.Name)
+					continue
+				}
+				words := len(strings.Fields(desc))
+				if err := p.db.UpdateSnippetDescription(ctx, s.SnippetID, desc); err != nil {
+					log.Printf("enrich: [snippet] db error — %s:%s: %v", f.Path, s.Name, err)
+				} else {
+					mu.Lock()
+					snipsEnriched++
+					mu.Unlock()
+					log.Printf("enrich: [snippet] OK (%d words) — %s:%s", words, f.Path, s.Name)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	log.Printf("enrich: done — %d file summaries, %d snippet descriptions written", filesEnriched, snipsEnriched)
+	return nil
 }
 
 // Search performs cosine-similarity search against all embedded snippets.

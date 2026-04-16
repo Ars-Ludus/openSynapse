@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -40,16 +41,22 @@ func (l *LLM) SummariseFile(ctx context.Context, f *models.CodeFile, snippetName
 	if !l.enabled() {
 		return "", nil
 	}
+	imports := strings.Join(f.Dependencies, ", ")
+	if imports == "" {
+		imports = "(none)"
+	}
+	symbols := strings.Join(snippetNames, ", ")
+	if symbols == "" {
+		symbols = "(none)"
+	}
 	prompt := fmt.Sprintf(
-		"You are a senior software engineer reviewing code.\n\n"+
+		"You are a senior software engineer. Respond with exactly one short paragraph.\n\n"+
 			"File: %s\nLanguage: %s\nImports: %s\nTop-level symbols: %s\n\n"+
-			"Write one concise paragraph (max 3 sentences) describing what this file does "+
-			"and its role in the codebase. Be specific and technical.",
-		f.Path, f.Language,
-		strings.Join(f.Dependencies, ", "),
-		strings.Join(snippetNames, ", "),
+			"Describe what this file does and its role in the codebase in 2-3 sentences. "+
+			"Be specific and technical.",
+		f.Path, f.Language, imports, symbols,
 	)
-	return l.complete(ctx, prompt, 256)
+	return l.complete(ctx, prompt, 1024)
 }
 
 // SummariseSnippet generates a description for a single code snippet.
@@ -61,15 +68,20 @@ func (l *LLM) SummariseSnippet(ctx context.Context, s *models.Snippet, filePath 
 	if len(raw) > 3000 {
 		raw = raw[:3000] + "\n// ... (truncated)"
 	}
+	name := s.Name
+	if name == "" {
+		name = "(unnamed)"
+	}
 	prompt := fmt.Sprintf(
-		"You are a senior software engineer.\n\n"+
+		"You are a senior software engineer. Respond with exactly one sentence.\n\n"+
 			"File: %s\n"+
-			"Code (%s '%s', lines %d-%d):\n```\n%s\n```\n\n"+
-			"Write one concise sentence explaining what this code does. "+
+			"Symbol: %s %s (lines %d-%d)\n\n"+
+			"%s\n\n"+
+			"Describe what this code does in one concise sentence. "+
 			"Focus on purpose and behaviour, not implementation details.",
-		filePath, s.SnippetType, s.Name, s.LineStart, s.LineEnd, raw,
+		filePath, s.SnippetType, name, s.LineStart, s.LineEnd, raw,
 	)
-	return l.complete(ctx, prompt, 150)
+	return l.complete(ctx, prompt, 1024)
 }
 
 // SummariseEdge produces a merged-context description for a reference edge.
@@ -87,7 +99,7 @@ func (l *LLM) SummariseEdge(ctx context.Context, src, dst *models.Snippet, edgeT
 		src.SnippetType, src.Name, truncate(src.RawContent, 800),
 		dst.SnippetType, dst.Name, truncate(dst.RawContent, 800),
 	)
-	return l.complete(ctx, prompt, 120)
+	return l.complete(ctx, prompt, 1024)
 }
 
 // ── OpenAI-compatible chat completion ─────────────────────────────────────────
@@ -106,8 +118,10 @@ type chatMessage struct {
 type chatResponse struct {
 	Choices []struct {
 		Message struct {
-			Content string `json:"content"`
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content,omitempty"`
 		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Error *struct {
 		Message string `json:"message"`
@@ -156,10 +170,17 @@ func (l *LLM) complete(ctx context.Context, prompt string, maxTokens int) (strin
 		return "", fmt.Errorf("llm error: %s", cr.Error.Message)
 	}
 	if len(cr.Choices) == 0 {
+		log.Printf("llm: empty choices — raw body: %.500s", raw)
 		return "", nil
 	}
 
-	return strings.TrimSpace(cr.Choices[0].Message.Content), nil
+	choice := cr.Choices[0]
+	content := strings.TrimSpace(choice.Message.Content)
+	if content == "" {
+		log.Printf("llm: empty content (finish_reason=%q, reasoning_tokens=%d) — raw body: %.300s",
+			choice.FinishReason, len(choice.Message.ReasoningContent), raw)
+	}
+	return content, nil
 }
 
 func truncate(s string, n int) string {
