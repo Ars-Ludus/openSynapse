@@ -9,9 +9,9 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
-	"opensynapse/internal/db"
-	"opensynapse/internal/models"
-	"opensynapse/internal/pipeline"
+	"github.com/Ars-Ludus/openSynapse/internal/db"
+	"github.com/Ars-Ludus/openSynapse/internal/models"
+	"github.com/Ars-Ludus/openSynapse/internal/pipeline"
 )
 
 // Service holds the two runtime dependencies shared by all tool operations.
@@ -211,6 +211,56 @@ func (s *Service) ReindexFile(ctx context.Context, path string) error {
 		return fmt.Errorf("reindex: %w", err)
 	}
 	return nil
+}
+
+// GetImplementations returns all struct snippets that implement a given
+// interface (connected via EdgeTypeDefinition edges).
+func (s *Service) GetImplementations(ctx context.Context, snippetID string) ([]*SnippetSummary, error) {
+	id, err := uuid.Parse(snippetID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid snippet_id %q: %w", snippetID, err)
+	}
+
+	sn, err := s.DB.GetSnippetByID(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("get_implementations: %w", err)
+	}
+	if sn == nil || sn.SnippetType != models.SnippetInterface {
+		return nil, nil
+	}
+
+	// Find edges where this interface is the target and type is "type_definition".
+	edges, err := s.DB.GetDependents(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("get_implementations edges: %w", err)
+	}
+
+	var impls []*SnippetSummary
+	for _, e := range edges {
+		if e.EdgeType != models.EdgeTypeDefinition {
+			continue
+		}
+		impl, err := s.DB.GetSnippetByID(ctx, e.SourceSnippetID)
+		if err != nil || impl == nil {
+			continue
+		}
+		impls = append(impls, toSummary(impl))
+	}
+	return impls, nil
+}
+
+// ListPatterns returns all detected patterns with their snippet IDs.
+func (s *Service) ListPatterns(ctx context.Context) ([]*models.Pattern, error) {
+	patterns, err := s.DB.ListPatterns(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list_patterns: %w", err)
+	}
+	return patterns, nil
+}
+
+// DetectPatterns runs pattern detection over the indexed graph.
+func (s *Service) DetectPatterns(ctx context.Context) error {
+	return s.Pipeline.DetectPatterns(ctx)
 }
 
 // ── internal helpers ──────────────────────────────────────────────────────────

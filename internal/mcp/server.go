@@ -10,7 +10,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
-	"opensynapse/internal/service"
+	"github.com/Ars-Ludus/openSynapse/internal/service"
 )
 
 // Server wraps a service.Service and exposes its operations as MCP tools.
@@ -90,6 +90,24 @@ func (s *Server) registerTools() {
 			),
 		),
 		s.handleSearch,
+	)
+
+	s.srv.AddTool(
+		mcp.NewTool("get_patterns",
+			mcp.WithDescription("Returns all detected architectural patterns and conventions in the codebase. Each pattern includes a name, description, and the IDs of participating snippets. Use this to understand 'how things are done here' before writing new code that should follow existing conventions."),
+		),
+		s.handleGetPatterns,
+	)
+
+	s.srv.AddTool(
+		mcp.NewTool("get_implementations",
+			mcp.WithDescription("Given an interface snippet ID, returns all concrete struct types that implement it. Use this to understand what types satisfy an interface when tracing runtime dispatch paths."),
+			mcp.WithString("snippet_id",
+				mcp.Required(),
+				mcp.Description("UUID of the interface snippet."),
+			),
+		),
+		s.handleGetImplementations,
 	)
 
 	s.srv.AddTool(
@@ -173,6 +191,29 @@ func (s *Server) handleSearch(ctx context.Context, req mcp.CallToolRequest) (*mc
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	return jsonResult(map[string]any{"results": results})
+}
+
+func (s *Server) handleGetImplementations(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	id, err := req.RequireString("snippet_id")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	impls, err := s.svc.GetImplementations(ctx, id)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if impls == nil {
+		return mcp.NewToolResultError(fmt.Sprintf("not an interface or not found: %s", id)), nil
+	}
+	return jsonResult(map[string]any{"implementations": impls})
+}
+
+func (s *Server) handleGetPatterns(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	patterns, err := s.svc.ListPatterns(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return jsonResult(map[string]any{"patterns": patterns})
 }
 
 func (s *Server) handleGetDependencies(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

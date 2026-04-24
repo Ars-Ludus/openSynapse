@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"opensynapse/internal/models"
+	"github.com/Ars-Ludus/openSynapse/internal/models"
 )
 
 // FileInfo is a lightweight record of a discovered source file.
@@ -47,17 +47,23 @@ var extToLang = map[string]models.Language{
 }
 
 // Walk recursively traverses root and returns all indexable source files.
+// Returned paths are relative to root (e.g. "internal/db/db.go").
 func Walk(root string) ([]*FileInfo, error) {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return nil, err
+	}
+
 	var files []*FileInfo
 
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	err = filepath.WalkDir(absRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil // skip unreadable entries
 		}
 
 		if d.IsDir() {
 			// Never skip the root itself; only skip hidden/vendor dirs inside it.
-			if path != root && (skipDirs[d.Name()] || strings.HasPrefix(d.Name(), ".")) {
+			if path != absRoot && (skipDirs[d.Name()] || strings.HasPrefix(d.Name(), ".")) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -73,8 +79,13 @@ func Walk(root string) ([]*FileInfo, error) {
 			return nil
 		}
 
+		rel, err := filepath.Rel(absRoot, path)
+		if err != nil {
+			return nil
+		}
+
 		files = append(files, &FileInfo{
-			Path:     path,
+			Path:     filepath.ToSlash(rel),
 			Language: lang,
 			Size:     info.Size(),
 		})

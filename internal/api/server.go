@@ -5,7 +5,7 @@ package api
 import (
 	"net/http"
 
-	"opensynapse/internal/service"
+	"github.com/Ars-Ludus/openSynapse/internal/service"
 )
 
 // Server wraps a service.Service and exposes it over HTTP.
@@ -46,6 +46,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /snippets/{id}/dependencies", s.getDependencies)
 	s.mux.HandleFunc("GET /snippets/{id}/dependents", s.getDependents)
 	s.mux.HandleFunc("GET /snippets/{id}", s.getSnippet)
+
+	// Patterns
+	s.mux.HandleFunc("GET /patterns", s.listPatterns)
 
 	// Reindex
 	s.mux.HandleFunc("POST /reindex", s.reindex)

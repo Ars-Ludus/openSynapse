@@ -71,7 +71,8 @@ func (d *DB) Migrate(_ context.Context) error {
     dependencies  TEXT    NOT NULL DEFAULT '[]',
     file_summary  TEXT    NOT NULL DEFAULT '',
     file_size     INTEGER NOT NULL DEFAULT 0,
-    last_modified INTEGER NOT NULL DEFAULT 0
+    last_modified INTEGER NOT NULL DEFAULT 0,
+    content_hash  TEXT    NOT NULL DEFAULT ''
 )`,
 		`CREATE TABLE IF NOT EXISTS snippets (
     snippet_id   TEXT    PRIMARY KEY,
@@ -83,7 +84,9 @@ func (d *DB) Migrate(_ context.Context) error {
     raw_content  TEXT    NOT NULL DEFAULT '',
     description  TEXT    NOT NULL DEFAULT '',
     wikilinks    TEXT    NOT NULL DEFAULT '[]',
-    embedding    BLOB
+    embedding          BLOB,
+    metadata           TEXT NOT NULL DEFAULT '{}',
+    call_chain_summary TEXT NOT NULL DEFAULT ''
 )`,
 		`CREATE INDEX IF NOT EXISTS idx_snippets_file_id ON snippets(file_id)`,
 		`CREATE TABLE IF NOT EXISTS edges (
@@ -97,11 +100,41 @@ func (d *DB) Migrate(_ context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_snippet_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_snippet_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_code_files_path ON code_files(path)`,
+		`CREATE TABLE IF NOT EXISTS wikilink_colors (
+    id         TEXT PRIMARY KEY,
+    snippet_id TEXT NOT NULL REFERENCES snippets(snippet_id) ON DELETE CASCADE,
+    wikilink   TEXT NOT NULL,
+    color      TEXT NOT NULL DEFAULT '#ffffff',
+    UNIQUE(snippet_id, wikilink)
+)`,
+		`CREATE INDEX IF NOT EXISTS idx_wikilink_colors_snippet ON wikilink_colors(snippet_id)`,
+		`CREATE TABLE IF NOT EXISTS patterns (
+    pattern_id   TEXT PRIMARY KEY,
+    name         TEXT NOT NULL DEFAULT '',
+    description  TEXT NOT NULL DEFAULT '',
+    pattern_type TEXT NOT NULL DEFAULT '',
+    embedding    BLOB
+)`,
+		`CREATE TABLE IF NOT EXISTS pattern_snippets (
+    pattern_id TEXT NOT NULL REFERENCES patterns(pattern_id) ON DELETE CASCADE,
+    snippet_id TEXT NOT NULL REFERENCES snippets(snippet_id) ON DELETE CASCADE,
+    PRIMARY KEY (pattern_id, snippet_id)
+)`,
 	}
 	for _, s := range stmts {
 		if _, err := d.sql.Exec(s); err != nil {
 			return fmt.Errorf("migrate: %w", err)
 		}
+	}
+
+	// Incremental column additions — safe to re-run (errors ignored if column exists).
+	alters := []string{
+		`ALTER TABLE code_files ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE snippets ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'`,
+		`ALTER TABLE snippets ADD COLUMN call_chain_summary TEXT NOT NULL DEFAULT ''`,
+	}
+	for _, s := range alters {
+		_, _ = d.sql.Exec(s)
 	}
 	return nil
 }

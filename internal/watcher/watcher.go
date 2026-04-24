@@ -5,21 +5,27 @@ package watcher
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"opensynapse/internal/crawler"
-	"opensynapse/internal/pipeline"
+	"github.com/Ars-Ludus/openSynapse/internal/crawler"
+	"github.com/Ars-Ludus/openSynapse/internal/pipeline"
 )
 
 const debounceDelay = 500 * time.Millisecond
 
 // Watch monitors root for file changes and re-indexes affected files.
-// It blocks until ctx is cancelled.
+// It blocks until ctx is cancelled. File paths are converted to repo-relative
+// before passing to the pipeline.
 func Watch(ctx context.Context, root string, pl *pipeline.Pipeline) error {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		return err
@@ -27,11 +33,11 @@ func Watch(ctx context.Context, root string, pl *pipeline.Pipeline) error {
 	defer w.Close()
 
 	// Add the root and every sub-directory to the watcher.
-	if err := addDirs(w, root); err != nil {
+	if err := addDirs(w, absRoot); err != nil {
 		return err
 	}
 
-	log.Printf("watcher: monitoring %s", root)
+	slog.Info("watcher: monitoring", "root", absRoot)
 
 	// pending maps file path → timer for debouncing rapid writes.
 	pending := make(map[string]*time.Timer)
@@ -45,18 +51,18 @@ func Watch(ctx context.Context, root string, pl *pipeline.Pipeline) error {
 			if !ok {
 				return nil
 			}
-			handleEvent(ctx, event, w, pl, pending)
+			handleEvent(ctx, event, w, pl, pending, absRoot)
 
 		case err, ok := <-w.Errors:
 			if !ok {
 				return nil
 			}
-			log.Printf("watcher: error: %v", err)
+			slog.Error("watcher: fsnotify error", "err", err)
 		}
 	}
 }
 
-func handleEvent(ctx context.Context, event fsnotify.Event, w *fsnotify.Watcher, pl *pipeline.Pipeline, pending map[string]*time.Timer) {
+func handleEvent(ctx context.Context, event fsnotify.Event, w *fsnotify.Watcher, pl *pipeline.Pipeline, pending map[string]*time.Timer, root string) {
 	path := event.Name
 
 	// Handle new directories: add them to the watcher.
@@ -70,30 +76,39 @@ func handleEvent(ctx context.Context, event fsnotify.Event, w *fsnotify.Watcher,
 		return
 	}
 
+	// Convert absolute fsnotify path to repo-relative.
+	relPath, err := filepath.Rel(root, path)
+	if err != nil {
+		slog.Error("watcher: relative path", "path", path, "err", err)
+		return
+	}
+	relPath = filepath.ToSlash(relPath)
+
 	// Debounce: reset the timer each time the same path fires.
-	if t, ok := pending[path]; ok {
+	if t, ok := pending[relPath]; ok {
 		t.Reset(debounceDelay)
 		return
 	}
 
-	pending[path] = time.AfterFunc(debounceDelay, func() {
-		delete(pending, path)
-		reindex(ctx, pl, event, path)
+	pending[relPath] = time.AfterFunc(debounceDelay, func() {
+		delete(pending, relPath)
+		reindex(ctx, pl, event, relPath)
 	})
 }
 
-func reindex(ctx context.Context, pl *pipeline.Pipeline, event fsnotify.Event, path string) {
+func reindex(ctx context.Context, pl *pipeline.Pipeline, event fsnotify.Event, relPath string) {
 	if event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
-		// File removed — the DB entry (and cascaded snippets/edges) will be
-		// cleaned up automatically if the file is re-indexed and found missing.
-		log.Printf("watcher: file removed %s", path)
+		slog.Info("watcher: file removed, deleting from DB", "path", relPath)
+		if err := pl.DeleteFile(ctx, relPath); err != nil {
+			slog.Error("watcher: delete", "path", relPath, "err", err)
+		}
 		return
 	}
 
 	if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
-		log.Printf("watcher: re-indexing %s", path)
-		if err := pl.IndexFile(ctx, path); err != nil {
-			log.Printf("watcher: index %s: %v", path, err)
+		slog.Info("watcher: re-indexing", "path", relPath)
+		if err := pl.IndexFile(ctx, relPath); err != nil {
+			slog.Error("watcher: index", "path", relPath, "err", err)
 		}
 	}
 }
@@ -109,10 +124,11 @@ func addDirs(w *fsnotify.Watcher, root string) error {
 	_ = w.Add(root)
 
 	for _, f := range files {
-		dir := filepath.Dir(f.Path)
-		if !seen[dir] {
-			seen[dir] = true
-			_ = w.Add(dir)
+		// f.Path is repo-relative; resolve to absolute for the watcher.
+		absDir := filepath.Dir(filepath.Join(root, filepath.FromSlash(f.Path)))
+		if !seen[absDir] {
+			seen[absDir] = true
+			_ = w.Add(absDir)
 		}
 	}
 	return nil

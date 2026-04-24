@@ -1,433 +1,125 @@
-# openSynapse Documentation
-
-## Table of Contents
-
-1. [Commands](#commands)
-2. [Environment Variables](#environment-variables)
-3. [HTTP API](#http-api)
-4. [MCP Server](#mcp-server)
-5. [Embedding Sidecar](#embedding-sidecar)
-6. [Architecture](#architecture)
-7. [Data Model](#data-model)
-8. [Extending the System](#extending-the-system)
-
----
+# openSynapse -- Reference
 
 ## Commands
 
-All commands are run via the `oSyn` binary built from `./cmd/oSyn/`.
+Build with `go build -o oSyn ./cmd/oSyn/` or install with `go install github.com/Ars-Ludus/openSynapse/cmd/oSyn@latest`.
 
-```
-oSyn <command> [flags]
-```
+All commands that access a database auto-migrate the schema on startup. The `--repo <name>` flag is available on all commands to target a specific registered repo. Without it, the current repo is auto-detected from the working directory.
 
-### `oSyn migrate`
-
-Creates or updates the database schema. Run this once before using a new database file. Every other command also auto-migrates on startup, so explicit use is optional.
+### Setup
 
 ```bash
-oSyn migrate
+oSyn init [--name <name>] [--path <dir>]  # register a repo, create its database
+oSyn repos                                 # list all tracked repos
+oSyn repos remove <name> [--delete-db]     # unregister a repo
+oSyn config show                           # print resolved configuration
+oSyn config set <key> <value>              # set a value in ~/.osyn/config.json
 ```
 
-No flags.
+`init` registers the current directory (or `--path`) as a tracked repo. The name defaults to the directory name. Creates a new SQLite database in `~/.osyn/repos/`.
 
----
+Config keys: `llm.provider`, `llm.base_url`, `llm.model`, `llm.api_key`, `embedding.provider`, `embedding.dimension`, `embedding.local_url`, `embedding.voyage_api_key`, `max_concurrency`.
 
-### `oSyn index`
-
-Crawls a directory tree, parses source files with Tree-sitter, resolves cross-file import edges, and enriches each snippet with an LLM description and a semantic embedding. Re-indexing a file that already exists in the database is safe and idempotent — old snippets and edges are purged via `DELETE CASCADE` before the new ones are inserted.
+### Indexing
 
 ```bash
-oSyn index [--path <dir>]
+oSyn index  [--path <dir>]           # full index of a directory tree
+oSyn watch  [--path <dir>]           # initial index, then live incremental updates
 ```
 
-| Flag | Short | Default | Description |
-|------|-------|---------|-------------|
-| `--path` | `-p` | `.` | Root directory to crawl |
+`--path` defaults to the repo root from the registry. `index` crawls, parses, resolves edges, and enriches every source file. Re-indexing is idempotent -- old data is purged via CASCADE before new data is inserted. Files > 2 MB are skipped. Hidden directories, `vendor/`, and `node_modules/` are excluded.
 
-**What it does per file:**
+All file paths stored in the database are **repo-relative** (e.g. `internal/db/db.go`), making databases portable if the repo moves on disk.
 
-1. Detect language from file extension
-2. Parse AST with Tree-sitter → extract top-level Snippets and import paths
-3. Purge the file's old DB row (cascades to its snippets and edges)
-4. Insert the `code_files` row and all `snippets` rows
-5. Resolve cross-file edges (import → exported symbol matching)
-6. For each snippet: call the LLM for a one-sentence description, then embed the description (or raw content if the LLM is disabled) via the embedding sidecar
+`watch` runs a full index, then monitors the filesystem with fsnotify (500 ms debounce). On file changes:
+- **Content hash check** -- SHA-256 of file content is compared to the stored hash. If unchanged, the file is skipped entirely.
+- **Deletion handling** -- removed/renamed files are deleted from the DB (CASCADE cleans up snippets and edges).
+- **Edge cascade** -- when file A is re-indexed, files that had edges into A's old snippets are automatically re-resolved against A's new snippets without re-enrichment.
 
-Files larger than 2 MB are skipped. Hidden directories (`.git`, `.venv`, etc.) and `vendor`/`node_modules` trees are excluded automatically.
-
-**Concurrency:** up to `MAX_CONCURRENCY` files are processed in parallel (default: 4).
-
----
-
-### `oSyn watch`
-
-Runs an initial full index of the target directory, then enters a persistent watch loop. Any write or creation event on a recognised source file triggers a re-index of that file after a 500 ms debounce window.
+### Enrichment
 
 ```bash
-oSyn watch [--path <dir>]
+oSyn enrich [--force]                # fill missing LLM descriptions (--force overwrites existing)
+oSyn enrich-chains [--depth <n>]     # generate call-chain summaries (default depth: 3)
+oSyn detect-patterns                 # detect architectural patterns across the graph
 ```
 
-| Flag | Short | Default | Description |
-|------|-------|---------|-------------|
-| `--path` | `-p` | `.` | Root directory to watch |
+`enrich` generates LLM descriptions for files and snippets that are missing them. `--force` re-generates all descriptions.
 
-Stop with `Ctrl-C` (SIGINT) or SIGTERM.
+`enrich-chains` walks outgoing edges from each function/method up to `--depth` levels, collects the chain of descriptions, and asks the LLM to summarize the execution path. Results are stored in `snippets.call_chain_summary`.
 
----
+`detect-patterns` runs structural grouping (fan-out analysis, naming conventions) then sends candidate groups to the LLM for filtering and naming. Previous patterns are cleared and re-detected.
 
-### `oSyn search`
-
-Embeds the query string and performs a cosine-distance search over all indexed snippets. Prints human-readable results to stdout.
+### Search
 
 ```bash
-oSyn search <query> [--limit <n>]
+oSyn search <query> [--limit <n>]    # semantic search over snippets (default limit: 5)
 ```
 
-| Argument / Flag | Short | Default | Description |
-|-----------------|-------|---------|-------------|
-| `<query>` | — | required | Natural language or code query |
-| `--limit` | `-n` | `5` | Number of results to return |
+Embeds the query and returns snippets by cosine distance. Requires a real embedding provider (`local` or `voyage`).
 
-**Note:** Search requires a real embedding provider (`local` or `voyage`). With the default `null` provider all vectors are zero and results are unordered.
-
----
-
-### `oSyn serve`
-
-Starts the HTTP REST API server. All endpoints are documented in the [HTTP API](#http-api) section.
+### Query
 
 ```bash
-oSyn serve [--port <n>]
+oSyn query files                     # list all indexed files
+oSyn query file --path <path>        # file metadata + snippet listing (no raw source)
+oSyn query snippet --id <uuid>       # full snippet with source, metadata, call chain
+oSyn query blast-radius --id <uuid>  # dependents + dependencies (who breaks if I change this?)
+oSyn query deps --id <uuid>          # outgoing edges only (what does this call?)
+oSyn query patterns                  # list detected architectural patterns
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--port` | `8080` | TCP port to listen on |
+All output is JSON. Pipe to `jq` for filtering.
 
----
-
-### `oSyn serve-mcp`
-
-Starts the MCP (Model Context Protocol) server over stdio. Designed for direct integration with Claude Code and Claude Desktop. All tools are documented in the [MCP Server](#mcp-server) section.
+### Servers
 
 ```bash
-oSyn serve-mcp
-```
-
-No flags. All configuration is via environment variables (same as other commands). Log output is redirected to stderr to keep stdout clean for JSON-RPC.
-
----
-
-### `oSyn query`
-
-Direct CLI access to the same tool operations used by the HTTP API and MCP server. All output is JSON — pipe to `jq` for filtering or use in scripts.
-
-```bash
-oSyn query <subcommand> [flags]
-```
-
-#### `oSyn query files`
-
-Lists all indexed files with path, language, file size, and LLM-generated summary.
-
-```bash
-oSyn query files
-```
-
-#### `oSyn query file`
-
-Returns a file's full metadata plus a compact listing of all its snippets (name, type, line range, description — no raw source).
-
-```bash
-oSyn query file --path <path>
-```
-
-| Flag | Short | Required | Description |
-|------|-------|----------|-------------|
-| `--path` | `-p` | yes | File path to describe |
-
-#### `oSyn query snippet`
-
-Returns the complete source code and metadata for a single snippet by UUID.
-
-```bash
-oSyn query snippet --id <uuid>
-```
-
-#### `oSyn query blast-radius`
-
-Returns a snippet, every snippet that calls/references it (dependents), and every snippet it calls (dependencies). `blast_radius_count` is the number of dependents — a quick signal for how cautiously to treat a change.
-
-```bash
-oSyn query blast-radius --id <uuid>
-```
-
-#### `oSyn query deps`
-
-Returns a snippet and the snippets it directly calls or references (outgoing edges only). Use `blast-radius` for the full bi-directional picture.
-
-```bash
-oSyn query deps --id <uuid>
+oSyn serve [--port <n>]              # HTTP REST API (default port: 8080)
+oSyn serve-mcp                       # MCP server over stdio (for Claude Code / Claude Desktop)
+oSyn migrate                         # explicit schema migration (rarely needed)
 ```
 
 ---
 
-## Environment Variables
+## Configuration
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DATABASE_PATH` | `./opensynapse.db` | Path to the SQLite file. Created automatically if it does not exist. |
-| `EMBED_PROVIDER` | `null` | Embedding backend. Options: `local` (CodeRankEmbed sidecar), `voyage` (Voyage AI API), `null` (zero vectors, indexing only). |
-| `EMBED_DIMENSION` | `768` | Vector dimension. Must match the model output. CodeRankEmbed = 768, Voyage code-2 = 1024. |
-| `LOCAL_EMBED_URL` | `http://127.0.0.1:8765` | Base URL of the embedding sidecar. Used when `EMBED_PROVIDER=local`. |
-| `VOYAGE_API_KEY` | — | Voyage AI API key. Required when `EMBED_PROVIDER=voyage`. |
-| `LOCAL_LLM_URL` | — | Base URL of an OpenAI-compatible chat completions server (e.g. `http://host:8080/v1`). LLM enrichment is disabled if this is unset. |
-| `LOCAL_LLM_MODEL` | `local-model` | Model name sent in the `"model"` field of LLM requests. |
-| `MAX_CONCURRENCY` | `4` | Maximum number of files processed simultaneously during `index` and `watch`. |
-
----
-
-## HTTP API
-
-Start with `oSyn serve [--port 8080]`. All responses are JSON.
-
-### Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Returns `{"status":"ok"}` |
-| `GET` | `/files` | List all indexed files |
-| `GET` | `/files/{path}` | File metadata + snippet listing (no raw source) |
-| `GET` | `/files/{path}/snippets` | Snippet listing only |
-| `POST` | `/search` | Semantic search |
-| `GET` | `/snippets/{id}` | Full snippet with raw source |
-| `GET` | `/snippets/{id}/dependencies` | Outgoing edges (what this snippet calls) |
-| `GET` | `/snippets/{id}/dependents` | Incoming edges (what calls this snippet) |
-| `POST` | `/reindex` | Re-index a single file |
-
-### Request / Response Examples
-
-**`POST /search`**
-
-```bash
-curl -X POST http://localhost:8080/search \
-     -H 'Content-Type: application/json' \
-     -d '{"query": "cosine distance vector search", "limit": 3}'
-```
+### Config file (`~/.osyn/config.json`)
 
 ```json
 {
-  "results": [
-    {
-      "snippet_id": "...",
-      "name": "vecDistanceCosine",
-      "snippet_type": "function",
-      "line_start": 28,
-      "line_end": 46,
-      "description": "Computes cosine distance between two float32 blobs...",
-      "raw_content": "func vecDistanceCosine(a, b []byte) float64 { ... }"
-    }
-  ]
+  "llm": {
+    "provider": "openai-compat",
+    "base_url": "http://192.168.1.1:8080/v1",
+    "model": "local-model",
+    "api_key": ""
+  },
+  "embedding": {
+    "provider": "local",
+    "dimension": 768,
+    "local_url": "http://127.0.0.1:8765"
+  },
+  "max_concurrency": 4
 }
 ```
 
-**`GET /files/internal/db/queries.go`**
+Environment variables override config file values. `DATABASE_PATH` bypasses the registry entirely when set.
 
-Returns `FileDetail` with the file record and a `snippets` array (no `raw_content`). Use `GET /snippets/{id}` for full source of individual snippets.
-
-**`GET /snippets/{id}/dependents`**
-
-```json
-{
-  "snippet": { "snippet_id": "...", "name": "IndexFile", ... },
-  "dependents": [
-    {
-      "edge_type": "function_call",
-      "snippet": { "snippet_id": "...", "name": "IndexDir", "snippet_type": "function", ... }
-    }
-  ]
-}
-```
-
-**`POST /reindex`**
-
-```bash
-curl -X POST http://localhost:8080/reindex \
-     -H 'Content-Type: application/json' \
-     -d '{"path": "internal/db/queries.go"}'
-```
-
----
-
-## MCP Server
-
-Start with `oSyn serve-mcp`. The server communicates over stdio using the Model Context Protocol (JSON-RPC 2.0) and is compatible with Claude Code and Claude Desktop.
-
-### Configuration
-
-Add to your Claude Code MCP settings (`.claude.json`):
-
-```json
-{
-  "mcpServers": {
-    "openSynapse": {
-      "command": "/absolute/path/to/oSyn",
-      "args": ["serve-mcp"],
-      "env": {
-        "DATABASE_PATH": "/absolute/path/to/opensynapse.db",
-        "EMBED_PROVIDER": "local",
-        "LOCAL_EMBED_URL": "http://127.0.0.1:8765",
-        "EMBED_DIMENSION": "768"
-      }
-    }
-  }
-}
-```
-
-### Tools
-
-All six tools are backed by the same `internal/service` implementations used by the HTTP API and CLI query commands.
-
----
-
-#### `list_files`
-
-Lists all indexed files with path, language, size, and LLM-generated summary.
-
-**Inputs:** none
-
-**Use when:** orienting yourself in an unfamiliar codebase before drilling into specific files.
-
----
-
-#### `describe_file`
-
-Returns a file's metadata and a compact listing of all its snippets (name, type, line range, description — no raw source).
-
-**Inputs:**
-
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `path` | string | yes | Repository-relative or absolute path to the source file |
-
-**Use when:** about to edit a file — get its full structure and responsibilities in one call.
-
----
-
-#### `get_snippet`
-
-Returns the complete source code and metadata for a single snippet.
-
-**Inputs:**
-
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `snippet_id` | string | yes | UUID from `describe_file` or `search` |
-
----
-
-#### `get_blast_radius`
-
-Pre-edit safety analysis. Returns the snippet, every snippet that directly calls or references it (dependents), and every snippet it calls (dependencies). Includes `blast_radius_count` — the number of dependents — as a quick signal for how cautiously to treat a change.
-
-**Inputs:**
-
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `snippet_id` | string | yes | UUID of the snippet to analyse |
-
-**Use when:** before modifying any function, type, or variable — see what breaks.
-
-**Response shape:**
-
-```json
-{
-  "snippet": { "snippet_id": "...", "name": "...", "raw_content": "..." },
-  "dependents": [
-    { "edge_type": "function_call", "snippet": { "name": "...", "file_id": "..." } }
-  ],
-  "dependencies": [
-    { "edge_type": "import_call", "snippet": { "name": "...", "file_id": "..." } }
-  ],
-  "blast_radius_count": 3
-}
-```
-
----
-
-#### `search`
-
-Semantic (vector) search over all indexed snippets. Returns the top N most similar results.
-
-**Inputs:**
-
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `query` | string | yes | Natural language or code description |
-| `limit` | integer | no | Results to return (default 5, max 20) |
-
-**Use when:** you don't know the exact file or function name — find relevant code by meaning.
-
----
-
-#### `get_dependencies`
-
-Returns a snippet and the snippets it directly calls or references (outgoing edges only).
-
-**Inputs:**
-
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `snippet_id` | string | yes | UUID of the snippet |
-
-**Use when:** tracing an execution path or generating accurate documentation. Use `get_blast_radius` for the full bi-directional picture.
-
----
-
-## Embedding Sidecar
-
-The sidecar runs CodeRankEmbed (a 160M-parameter NomicBERT model) locally via ONNX Runtime, exposing a minimal HTTP API over localhost. No GPU required.
-
-### Starting the sidecar
-
-```bash
-cd internal/vect-embed
-pip install -r requirements.txt
-python embedder.py --serve [PORT]
-```
-
-`PORT` defaults to `8765`.
-
-### HTTP API
-
-**`POST /embed`**
-
-```json
-{
-  "texts": ["def hello(): ..."],
-  "is_query": false
-}
-```
-
-- `is_query` — when `true`, prepends `"Query: "` before tokenisation (for search queries, not indexing)
-
-Response: `{"embeddings": [[0.91, -0.66, ...]]}` — 768-element `float32` vectors.
-
-### Model files
+### Home directory layout
 
 ```
-internal/vect-embed/
-├── embedder.py
-├── requirements.txt
-└── model/
-    ├── config.json
-    ├── tokenizer.json
-    └── onnx/
-        └── model.onnx
+~/.osyn/
+  config.json          # global settings (LLM, embedding, concurrency)
+  registry.json        # repo name -> {root, db_path, last_indexed}
+  repos/               # one SQLite DB per tracked repo
+    my-project.db
+    other-repo.db
 ```
 
-The `vect-embed/` directory is gitignored — model files stay local.
+### Repo resolution order
+
+1. `DATABASE_PATH` env var (hard override, bypasses registry)
+2. `--repo <name>` flag (looked up in registry)
+3. Auto-detection: walk up from cwd looking for `.git/`, match root in registry
 
 ---
 
@@ -435,125 +127,334 @@ The `vect-embed/` directory is gitignored — model files stay local.
 
 ### Service layer
 
-All tool operations are implemented once in `internal/service/service.go` and consumed by three surfaces:
+All operations are implemented once in `internal/service/service.go`. The four surfaces are thin wrappers:
 
 ```
-internal/service/service.go   ← single source of tool logic
-        ↑              ↑              ↑
-internal/api/    internal/mcp/   cmd/oSyn/main.go
-(HTTP handlers)  (MCP tools)     (query subcommands)
+internal/service/service.go      <-- single source of truth
+      |          |          |          |
+  cmd/gui/   internal/  internal/  cmd/oSyn/
+  app.go     api/       mcp/       main.go
+  (GUI)      (HTTP)     (MCP)      (CLI)
 ```
-
-Adding a new operation means implementing it in `service.go` once, then adding thin wrappers in whichever surfaces need it.
 
 ### Pipeline phases
 
-Each file goes through three sequential phases during indexing:
-
 ```
-Phase 1 — Parse
-    crawler.Walk()       discovers source files
-    crawler.ReadFile()   reads up to 2 MB
-    parser.Parse()       Tree-sitter AST → Snippets + import paths
+Phase 1 -- Parse (concurrent, up to MAX_CONCURRENCY workers)
+    Tree-sitter AST --> Snippets + imports + control-flow metadata
+    Content hash check --> skip unchanged files
 
-Phase 2 — Resolve
-    resolver.ResolveFile()   matches import paths to files already in the DB,
-                             creates EdgeImportCall edges where a wikilink in
-                             the importing file matches an exported symbol name
-                             in the imported file
+Phase 2 -- Resolve (sequential, all files stable in DB)
+    Import-path matching --> EdgeImportCall edges
+    Wikilink pruning     --> keep only symbols with real edges
 
-Phase 3 — Enrich
-    llm.SummariseFile()      one-paragraph file description
-    llm.SummariseSnippet()   one-sentence snippet description (per snippet)
-    embedder.Embed()         768-dim vector of description (or raw content)
+Phase 3 -- Enrich (sequential)
+    LLM file summary     --> code_files.file_summary
+    LLM snippet desc     --> snippets.description
+    Embedding            --> snippets.embedding (768-dim float32 blob)
+
+Phase 4 -- Interface resolution (sequential, after all files)
+    Method-set matching  --> EdgeTypeDefinition edges (struct implements interface)
 ```
 
-### Vector storage and search
+### Incremental update pipeline (watcher)
 
-Embeddings are stored as raw little-endian IEEE 754 float32 blobs in `snippets.embedding BLOB`. The `vec_distance_cosine(a, b)` SQL function is registered as a Go callback via `go-sqlite3`'s `ConnectHook` — no shared extension library needed at runtime.
-
-```sql
-SELECT ... FROM snippets
-WHERE embedding IS NOT NULL
-ORDER BY vec_distance_cosine(embedding, ?) ASC
-LIMIT ?
+```
+fsnotify event --> debounce 500ms --> content hash check
+    |
+    +--> unchanged: skip
+    +--> deleted:   DELETE FROM code_files (CASCADE)
+    +--> modified:  capture dependent file IDs
+                    --> delete + re-insert file
+                    --> resolve edges
+                    --> enrich (LLM + embedding)
+                    --> re-resolve each dependent file's edges
 ```
 
 ### Key packages
 
-| Package | Path | Responsibility |
-|---------|------|----------------|
-| `service` | `internal/service/` | All tool operations — single source consumed by API, MCP, and CLI |
-| `api` | `internal/api/` | HTTP REST server; thin wrappers over `service` |
-| `mcp` | `internal/mcp/` | MCP stdio server; thin wrappers over `service` |
-| `crawler` | `internal/crawler/` | Walk directory tree, read files, detect language |
-| `parser` | `internal/parser/` | Tree-sitter AST → `ParsedFile{Imports, Snippets}` |
-| `resolver` | `internal/resolver/` | Heuristic cross-file edge creation |
-| `enrichment` | `internal/enrichment/` | LLM (`llm.go`) and embedding (`embedder.go`) |
-| `pipeline` | `internal/pipeline/` | Orchestrates the three phases; concurrency semaphore |
-| `watcher` | `internal/watcher/` | fsnotify loop with debounce |
-| `db` | `internal/db/` | SQLite connection, schema migration, all queries |
-| `models` | `internal/models/` | Shared struct types (`CodeFile`, `Snippet`, `Edge`) |
-| `config` | `internal/config/` | Env-var loading |
+| Package | Responsibility |
+|---------|----------------|
+| `service` | All tool operations -- consumed by GUI, API, MCP, CLI |
+| `pipeline` | Orchestrates parse -> resolve -> enrich; concurrency semaphore; stores repo root |
+| `parser` | Tree-sitter AST -> snippets, imports, control-flow metadata |
+| `resolver` | Cross-file edge creation; interface-to-implementation matching |
+| `enrichment` | LLM descriptions (`llm.go`), embeddings (`embedder.go`), pattern detection (`patterns.go`) |
+| `db` | SQLite connection, schema migration, all queries |
+| `watcher` | fsnotify loop with debounce, deletion handling, edge cascade |
+| `crawler` | Directory walk (returns repo-relative paths), file reading, language detection |
+| `models` | Shared types: `CodeFile`, `Snippet`, `Edge`, `Pattern`, `SnippetMetadata` |
+| `config` | Config file loading, env var overlay, repo resolution |
+| `registry` | Repo registry CRUD (`~/.osyn/registry.json`) |
+| `api` | HTTP REST server |
+| `mcp` | MCP stdio server |
+| `cmd/gui` | Wails desktop app |
 
 ---
 
 ## Data Model
 
-Three tables, two of which cascade on delete:
+Six tables. Snippet and edge deletions cascade from `code_files`.
 
+All file paths are stored **repo-relative** (e.g. `internal/db/db.go`), not absolute.
+
+### code_files
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `file_id` | TEXT PK | UUID |
+| `path` | TEXT UNIQUE | Repo-relative path; `lib:` prefix for synthetic library entries |
+| `language` | TEXT | `go`, `python`, `javascript`, `typescript`, `rust`, `external`, `unknown` |
+| `dependencies` | TEXT | JSON array of import paths |
+| `file_summary` | TEXT | LLM-generated paragraph |
+| `file_size` | INTEGER | Bytes |
+| `last_modified` | INTEGER | Unix timestamp |
+| `content_hash` | TEXT | SHA-256 hex; used to skip no-op re-indexes |
+
+### snippets
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `snippet_id` | TEXT PK | UUID |
+| `file_id` | TEXT FK | CASCADE DELETE from code_files |
+| `snippet_type` | TEXT | `function`, `method`, `struct`, `interface`, `class`, `variable`, `constant`, `external`, `unknown` |
+| `name` | TEXT | Symbol identifier |
+| `line_start` | INTEGER | 1-based |
+| `line_end` | INTEGER | 1-based |
+| `raw_content` | TEXT | Full source text of the snippet |
+| `description` | TEXT | LLM-generated one-sentence summary |
+| `wikilinks` | TEXT | JSON array of referenced symbol names (pruned to real edges) |
+| `embedding` | BLOB | 768 x float32, little-endian IEEE 754 |
+| `metadata` | TEXT | JSON `SnippetMetadata` (see below) |
+| `call_chain_summary` | TEXT | LLM-generated execution path narrative |
+
+#### SnippetMetadata (JSON in `metadata` column)
+
+```json
+{
+  "returns_error": true,
+  "early_returns": 2,
+  "branch_count": 3,
+  "goroutine_spawns": 1,
+  "channel_ops": 0,
+  "uses_mutex": false,
+  "has_panic": false,
+  "has_recover": false,
+  "has_defer": true,
+  "receiver": "Pipeline",
+  "interface_methods": ["Read", "Write", "Close"]
+}
 ```
-code_files
-    file_id       TEXT  PRIMARY KEY   (UUID)
-    path          TEXT  UNIQUE
-    language      TEXT
-    dependencies  TEXT               (JSON array of import paths)
-    file_summary  TEXT               (LLM-generated)
-    file_size     INTEGER
-    last_modified INTEGER            (Unix timestamp)
 
-snippets
-    snippet_id    TEXT  PRIMARY KEY   (UUID)
-    file_id       TEXT  → code_files  (CASCADE DELETE)
-    snippet_type  TEXT               ("function", "method", "struct", …)
-    name          TEXT
-    line_start    INTEGER
-    line_end      INTEGER
-    raw_content   TEXT
-    description   TEXT               (LLM-generated)
-    wikilinks     TEXT               (JSON array of referenced symbol names)
-    embedding     BLOB               (768 × float32, little-endian)
+All fields are omitted when zero/false. `receiver` is set on Go method snippets. `interface_methods` is set on Go interface snippets.
 
-edges
-    edge_id           TEXT  PRIMARY KEY   (UUID)
-    source_snippet_id TEXT  → snippets    (CASCADE DELETE)
-    target_snippet_id TEXT  → snippets    (CASCADE DELETE)
-    edge_type         TEXT               ("import_call", "function_call", …)
-    merged_context    TEXT               (LLM-generated, optional)
-    UNIQUE(source_snippet_id, target_snippet_id, edge_type)
+### edges
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `edge_id` | TEXT PK | UUID |
+| `source_snippet_id` | TEXT FK | CASCADE DELETE from snippets |
+| `target_snippet_id` | TEXT FK | CASCADE DELETE from snippets |
+| `edge_type` | TEXT | `import_call`, `variable_ref`, `type_definition`, `function_call`, `inheritance` |
+| `merged_context` | TEXT | Optional LLM-generated description of the relationship |
+
+UNIQUE constraint on `(source_snippet_id, target_snippet_id, edge_type)`.
+
+**Edge type semantics:**
+- `import_call` -- snippet A references an exported symbol defined in snippet B (cross-file)
+- `type_definition` -- struct A implements interface B (method-set satisfaction)
+
+### patterns
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `pattern_id` | TEXT PK | UUID |
+| `name` | TEXT | LLM-generated pattern name |
+| `description` | TEXT | LLM-generated explanation |
+| `pattern_type` | TEXT | `fan_out`, `naming` |
+| `embedding` | BLOB | For semantic search over patterns |
+
+### pattern_snippets (join table)
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `pattern_id` | TEXT FK | CASCADE DELETE from patterns |
+| `snippet_id` | TEXT FK | CASCADE DELETE from snippets |
+
+### wikilink_colors (GUI persistence)
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | TEXT PK | UUID |
+| `snippet_id` | TEXT FK | CASCADE DELETE from snippets |
+| `wikilink` | TEXT | Symbol name |
+| `color` | TEXT | Hex color string |
+
+---
+
+## HTTP API
+
+Start with `oSyn serve [--port 8080]`. All responses are JSON.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | `{"status":"ok"}` |
+| GET | `/files` | List all indexed files |
+| GET | `/files/{path}` | File metadata + snippet listing (no raw source) |
+| GET | `/files/{path}/snippets` | Snippet listing only |
+| POST | `/search` | Semantic search: `{"query": "...", "limit": 5}` |
+| GET | `/snippets/{id}` | Full snippet with source, metadata, call chain summary |
+| GET | `/snippets/{id}/dependencies` | Outgoing edges |
+| GET | `/snippets/{id}/dependents` | Incoming edges |
+| GET | `/patterns` | List detected patterns |
+| POST | `/reindex` | Re-index a file: `{"path": "..."}` |
+
+### Examples
+
+```bash
+# Semantic search
+curl -X POST http://localhost:8080/search \
+     -H 'Content-Type: application/json' \
+     -d '{"query": "cosine distance", "limit": 3}'
+
+# Blast radius
+curl http://localhost:8080/snippets/<uuid>/dependents
+
+# Patterns
+curl http://localhost:8080/patterns
 ```
 
 ---
 
-## Extending the System
+## MCP Server
+
+Start with `oSyn serve-mcp`. Communicates over stdio using JSON-RPC 2.0. Compatible with Claude Code and Claude Desktop.
+
+### Configuration
+
+Add to `.claude.json`:
+
+```json
+{
+  "mcpServers": {
+    "openSynapse": {
+      "command": "oSyn",
+      "args": ["serve-mcp", "--repo", "my-project"]
+    }
+  }
+}
+```
+
+No environment variables needed. For multi-repo setups, add multiple server entries with different `--repo` names.
+
+### Tools (9 total)
+
+| Tool | Inputs | Purpose |
+|------|--------|---------|
+| `list_files` | -- | Orient in an unfamiliar codebase |
+| `describe_file` | `path` | File structure and responsibilities before editing |
+| `get_snippet` | `snippet_id` | Full source, metadata, call chain summary |
+| `get_blast_radius` | `snippet_id` | Pre-edit safety: who depends on this, what does it depend on |
+| `search` | `query`, `limit?` | Find code by meaning when you don't know the name |
+| `get_dependencies` | `snippet_id` | Trace outgoing execution paths |
+| `get_patterns` | -- | Understand "how things are done here" |
+| `get_implementations` | `snippet_id` | Find concrete types implementing an interface |
+
+---
+
+## Embedding Sidecar
+
+Runs CodeRankEmbed (160M-parameter NomicBERT, ONNX) locally. No GPU required.
+
+```bash
+cd internal/vect-embed
+pip install -r requirements.txt
+python embedder.py --serve 8765
+```
+
+### API
+
+`POST /embed` with `{"texts": ["..."], "is_query": false}` returns `{"embeddings": [[...]]}` (768-dim float32 vectors). Set `is_query: true` for search queries (prepends "Query: " before tokenization).
+
+### Model files
+
+Place ONNX model files in `internal/vect-embed/model/`:
+
+```
+model/
+  config.json
+  tokenizer.json
+  onnx/
+    model.onnx
+```
+
+The `vect-embed/` directory is gitignored.
+
+---
+
+## Desktop GUI
+
+Native application built with Wails v2 (Go backend) + Svelte 5 (frontend). Reads from the same SQLite database as all other surfaces.
+
+### Building
+
+```bash
+make gui          # dev mode with hot reload
+make gui-run      # production build + launch
+make gui-build    # production build only
+```
+
+First-time setup:
+
+```bash
+go install github.com/wailsapp/wails/v2/cmd/wails@latest
+make gui-deps     # npm install in frontend/
+# Linux: sudo apt install libgtk-3-dev libwebkit2gtk-4.0-dev
+```
+
+### Layout
+
+```
++-----------------+------------------------------------------+
+|  EXPLORER       |  [Snippet Assembly] [File Info] [Code]   |
+|                 |                                          |
+|  > cmd/         |  +- myFunction -- function -- 12-45 --+ |
+|    v internal/  |  | Description...                      | |
+|      > db/      |  | [[Wikilink]] [[AnotherRef]]         | |
+|      > parser/  |  +------------------------------------+ |
++-----------------+------------------------------------------+
+```
+
+- **Sidebar** -- collapsible directory tree of all indexed files
+- **Editor area** -- up to two file panels side by side, each with three tabs:
+  - **Snippet Assembly** -- all snippets ordered by line, with type badge, name, description, and wikilink chips
+  - **File Info** -- path, language, dependencies, size, last modified, LLM summary
+  - **Code** -- assembled raw source with line numbers
+- **Wikilink coloring** -- right-click any `[[symbol]]` chip to color it. Colors propagate to all edge-connected snippets referencing the same symbol and persist in the database.
+
+---
+
+## Extending the system
 
 ### Add a tool operation
 
-1. Implement the logic in `internal/service/service.go` with a clear return type.
-2. Add an HTTP handler in `internal/api/handlers.go` and register a route in `server.go`.
-3. Add an MCP tool in `internal/mcp/server.go` (`registerTools` + a handler method).
-4. Add a CLI subcommand in `cmd/oSyn/main.go` under `queryCmd`.
+1. Implement in `internal/service/service.go`
+2. Add HTTP handler in `internal/api/handlers.go` + route in `server.go`
+3. Add MCP tool in `internal/mcp/server.go`
+4. Add CLI subcommand in `cmd/oSyn/main.go`
+5. Optionally add GUI binding in `cmd/gui/app.go` + regenerate TS bindings with `wails generate module`
 
 ### Add a language
 
-1. In `internal/parser/parser.go`, import the Tree-sitter grammar package.
-2. Add a case to `getLanguage(lang)` returning its `*sitter.Language`.
-3. Add entries to `topLevelNodeTypes` for the node types you want to extract as snippets.
-4. Add the file extension in `internal/crawler/crawler.go`'s `extToLang` map.
+1. Import the Tree-sitter grammar in `internal/parser/parser.go`
+2. Add a case to `languageFor()` returning the `*sitter.Language`
+3. Add entries to `topLevelNodeTypes` for snippet extraction
+4. Add import extraction in `extractImportSpecs()`
+5. Add file extension mapping in `internal/crawler/`
 
 ### Add an embedding provider
 
-Implement the `enrichment.Embedder` interface:
+Implement `enrichment.Embedder`:
 
 ```go
 type Embedder interface {
@@ -563,11 +464,9 @@ type Embedder interface {
 }
 ```
 
-Add a case to `NewEmbedder` in `internal/enrichment/embedder.go` and a corresponding env-var to `internal/config/config.go`.
-
-If the provider distinguishes query vs document embeddings, implement the optional `EmbedQuery(ctx, text) ([]float32, error)` method — the pipeline detects and uses it via interface assertion.
+Optionally implement `EmbedQuery(ctx, text) ([]float32, error)` for providers that distinguish query vs document embeddings.
 
 ### Add an edge type
 
-1. Add a constant to `models.EdgeType` in `internal/models/models.go`.
-2. Add detection logic in `internal/resolver/resolver.go`'s `ResolveFile` method.
+1. Add a constant to `models.EdgeType`
+2. Add detection logic in `internal/resolver/resolver.go`

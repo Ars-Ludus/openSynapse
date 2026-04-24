@@ -1,53 +1,76 @@
 # openSynapse
 
-Unlike traditional documentation tools that produce static text or RAG systems that rely on "fuzzy" searching, openSynapse treats a codebase as a living, physical circuit. It maps the invisible "Synapses" — the intentional relationships between files — translating complex AST data into a relational knowledge graph that both humans and AI agents can navigate with precision.
+A knowledge graph for codebases. openSynapse parses source files into an AST, extracts every function, method, struct, and class as a discrete **snippet**, resolves the cross-file relationships between them as **edges**, then enriches the graph with LLM descriptions, semantic embeddings, control-flow metadata, interface resolution, and architectural pattern detection.
 
-## Overview
+The result is a self-contained SQLite database that a human or AI agent can query to answer structural questions about a codebase with precision rather than fuzzy search.
 
-openSynapse (`oSyn`) crawls source files, extracts top-level code units (functions, methods, structs, classes) as **Snippets** using Tree-sitter, resolves cross-file import relationships as **Edges**, enriches each snippet with an LLM-generated description, and stores 768-dimensional semantic embeddings for vector search — all in a self-contained SQLite database.
-
-The knowledge graph is exposed through three surfaces that share a single implementation:
-
-- **CLI** — human-readable search and JSON query commands
-- **HTTP API** — REST endpoints for programmatic access
-- **MCP server** — stdio JSON-RPC for direct AI agent integration (Claude Code, Claude Desktop)
+## How it works
 
 ```
 Source files
-    │
-    ▼
-[Tree-sitter AST]  →  Snippets + Edges
-    │
-    ▼
-[Local LLM]        →  Descriptions
-    │
-    ▼
-[CodeRankEmbed]    →  768-dim vectors
-    │
-    ▼
-SQLite + vec_distance_cosine  →  Semantic search
-    │
-    ▼
-service layer  →  HTTP API · MCP tools · CLI query commands
+    |
+    v
+ Tree-sitter AST ---> Snippets (functions, methods, structs, ...)
+    |                  Edges    (import_call, type_definition, ...)
+    v                  Metadata (error paths, concurrency, branching)
+ LLM enrichment  ---> Descriptions, call-chain summaries, patterns
+    |
+    v
+ CodeRankEmbed   ---> 768-dim semantic vectors
+    |
+    v
+ SQLite database ---> CLI, HTTP API, MCP tools, Desktop GUI
 ```
 
-## Stack
+**Four surfaces** consume the same service layer:
 
-| Component | Choice | Notes |
-|-----------|--------|-------|
-| Language | Go 1.26 | CGO required (Tree-sitter) |
-| Database | SQLite | `go-sqlite3`, WAL mode, foreign keys |
-| Vector search | `vec_distance_cosine` | Registered Go callback — no extension .so needed |
-| AST parsing | Tree-sitter | `smacker/go-tree-sitter`; Go and Python grammars built in |
-| LLM enrichment | Any OpenAI-compatible endpoint | Tested with llama.cpp |
-| Embeddings | CodeRankEmbed (ONNX) | 768-dim, NomicBERT, top-20 MTEB, CPU-friendly |
-| File watching | fsnotify | 500 ms debounce for incremental re-indexing |
-| MCP server | `mark3labs/mcp-go` | stdio JSON-RPC; 6 tools for AI agent integration |
-| CLI | Cobra | `index`, `watch`, `search`, `migrate`, `serve`, `serve-mcp`, `query` |
+| Surface | Use case |
+|---------|----------|
+| CLI | `oSyn search "auth middleware"`, `oSyn query blast-radius --id <uuid>` |
+| HTTP API | Programmatic access, integrations |
+| MCP server | Direct AI agent integration (Claude Code, Claude Desktop) |
+| Desktop GUI | Visual exploration (Wails v2 + Svelte 5) |
 
-## Quick Start
+## Installation
 
-### 1. Start the embedding sidecar
+### From source
+
+```bash
+go install github.com/Ars-Ludus/openSynapse/cmd/oSyn@latest
+```
+
+Requires CGO (Tree-sitter and go-sqlite3 are C libraries). You need a C compiler (`gcc`, `clang`, or equivalent).
+
+### From release binaries
+
+Download from [GitHub Releases](https://github.com/Ars-Ludus/openSynapse/releases). Archives are available for linux/amd64, linux/arm64, darwin/amd64, darwin/arm64.
+
+### Build from checkout
+
+```bash
+git clone https://github.com/Ars-Ludus/openSynapse.git
+cd openSynapse
+go build -o oSyn ./cmd/oSyn/
+```
+
+## Quick start
+
+### 1. First-time setup
+
+```bash
+# Configure LLM enrichment (optional, any OpenAI-compatible endpoint)
+oSyn config set llm.provider openai-compat
+oSyn config set llm.base_url http://192.168.1.1:8080/v1
+oSyn config set llm.model local-model
+
+# Configure embeddings (required for semantic search)
+oSyn config set embedding.provider local
+oSyn config set embedding.local_url http://127.0.0.1:8765
+```
+
+Settings are stored in `~/.osyn/config.json`. Environment variables (`LLM_PROVIDER`, `EMBED_PROVIDER`, etc.) still override for CI/scripting.
+
+### 2. Start the embedding sidecar
 
 ```bash
 cd internal/vect-embed
@@ -55,95 +78,104 @@ pip install -r requirements.txt
 python embedder.py --serve 8765
 ```
 
-### 2. Set environment variables
+### 3. Register and index a repo
 
 ```bash
-export DATABASE_PATH=./opensynapse.db
-export EMBED_PROVIDER=local
-export LOCAL_EMBED_URL=http://127.0.0.1:8765
-export EMBED_DIMENSION=768
-
-# Optional — LLM enrichment (any OpenAI-compatible endpoint)
-export LOCAL_LLM_URL=http://192.168.1.1:8080/v1
-export LOCAL_LLM_MODEL=local-model
+cd /path/to/your/repo
+oSyn init                                # registers the repo in ~/.osyn/
+oSyn index                               # builds the knowledge graph
 ```
 
-### 3. Build and index
+Each repo gets its own SQLite database in `~/.osyn/repos/`. After `init`, all commands auto-detect which repo you're in based on your working directory.
+
+### 4. Query
 
 ```bash
-go build -o oSyn ./cmd/oSyn/
-
-./oSyn index --path /path/to/your/repo
-./oSyn search "how does authentication work"
-./oSyn watch --path /path/to/your/repo   # live, incremental updates
+oSyn search "how does authentication work"
+oSyn query blast-radius --id <uuid>      # what breaks if I change this?
+oSyn query patterns                      # detected architectural conventions
 ```
 
-### 4. Query the graph directly
+### 5. Live incremental updates
 
 ```bash
-# JSON output — pipe to jq for filtering
-./oSyn query files
-./oSyn query file --path internal/db/queries.go
-./oSyn query snippet --id <uuid>
-./oSyn query blast-radius --id <uuid>   # who breaks if I change this?
-./oSyn query deps --id <uuid>           # what does this call?
+oSyn watch
 ```
 
-### 5. Start the HTTP API
-
-```bash
-./oSyn serve --port 8080
-curl http://localhost:8080/health
-curl -X POST http://localhost:8080/search \
-     -H 'Content-Type: application/json' \
-     -d '{"query":"pipeline orchestration","limit":5}'
-```
+The watcher monitors the filesystem, skips files whose content hasn't changed (SHA-256), re-indexes modified files, cleans up deleted files, and cascades edge updates to dependent files automatically.
 
 ### 6. Connect to Claude via MCP
 
-Add to your Claude Code MCP configuration (`.claude.json` or settings):
+Add to `.claude.json`:
 
 ```json
 {
   "mcpServers": {
     "openSynapse": {
-      "command": "/path/to/oSyn",
-      "args": ["serve-mcp"],
-      "env": {
-        "DATABASE_PATH": "/path/to/opensynapse.db",
-        "EMBED_PROVIDER": "local",
-        "LOCAL_EMBED_URL": "http://127.0.0.1:8765",
-        "EMBED_DIMENSION": "768"
-      }
+      "command": "oSyn",
+      "args": ["serve-mcp", "--repo", "my-project"]
     }
   }
 }
 ```
 
-Claude will have access to six tools: `list_files`, `describe_file`, `get_snippet`, `get_blast_radius`, `search`, `get_dependencies`.
+No environment variables needed — `oSyn` reads `~/.osyn/config.json` for LLM/embedding settings and the registry for the database path.
 
-## Supported Languages
+Nine MCP tools: `list_files`, `describe_file`, `get_snippet`, `get_blast_radius`, `search`, `get_dependencies`, `get_patterns`, `get_implementations`, `get_call_chain`.
 
-Go, Python, JavaScript, TypeScript, Rust.
+## Multi-repo management
 
-Additional languages can be added by registering their Tree-sitter grammar in `internal/parser/parser.go`.
+```bash
+# Register repos
+cd ~/projects/backend && oSyn init
+cd ~/projects/frontend && oSyn init --name ui
 
-## Environment Variables
+# List all tracked repos
+oSyn repos
+
+# Query a specific repo from anywhere
+oSyn search "auth middleware" --repo backend
+
+# Remove a repo
+oSyn repos remove ui --delete-db
+```
+
+## What the graph captures
+
+| Layer | What it knows | How |
+|-------|--------------|-----|
+| **Structure** | Every function, method, struct, interface, class, constant, variable | Tree-sitter AST extraction |
+| **Relationships** | Which snippets call, import, or reference each other | Cross-file edge resolution |
+| **Types** | Which structs implement which interfaces | Method-set matching |
+| **Behavior** | Error returns, branching complexity, goroutine spawns, mutex usage, panic/recover, defer | AST control-flow analysis |
+| **Semantics** | What each snippet does, in one sentence | LLM description |
+| **Execution paths** | What happens when a function is called, 3 levels deep | LLM call-chain summaries |
+| **Conventions** | Recurring structural patterns across the codebase | Structural grouping + LLM synthesis |
+| **Similarity** | Which snippets are semantically related to a query | 768-dim cosine vector search |
+
+## Environment variables
+
+Environment variables override `~/.osyn/config.json` settings. Useful for CI or one-off runs.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DATABASE_PATH` | `./opensynapse.db` | Path to the SQLite database file |
-| `EMBED_PROVIDER` | `null` | `local`, `voyage`, or `null` |
-| `EMBED_DIMENSION` | `768` | Must match the model's output dimension |
-| `LOCAL_EMBED_URL` | `http://127.0.0.1:8765` | URL of the embedding sidecar |
-| `VOYAGE_API_KEY` | — | Required when `EMBED_PROVIDER=voyage` |
-| `LOCAL_LLM_URL` | — | OpenAI-compatible chat completions base URL |
-| `LOCAL_LLM_MODEL` | `local-model` | Model name sent in LLM requests |
+| `DATABASE_PATH` | (auto from registry) | SQLite database path — bypasses registry when set |
+| `EMBED_PROVIDER` | `null` | `local`, `voyage`, or `null` (no vectors) |
+| `EMBED_DIMENSION` | `768` | Must match model output dimension |
+| `LOCAL_EMBED_URL` | `http://127.0.0.1:8765` | Embedding sidecar URL |
+| `VOYAGE_API_KEY` | -- | Required when `EMBED_PROVIDER=voyage` |
+| `LLM_PROVIDER` | -- | `openai-compat`, `gemini`, or empty (disabled) |
+| `LLM_BASE_URL` | -- | OpenAI-compatible `/v1` base URL |
+| `LLM_MODEL` | `local-model` | Model name in LLM requests |
+| `LLM_API_KEY` | -- | Bearer token (any string for local servers) |
 | `MAX_CONCURRENCY` | `4` | Parallel file indexing workers |
 
-## Architecture
+## Supported languages
 
-See [DOCUMENTATION.md](DOCUMENTATION.md) for full command reference, HTTP API endpoints, MCP tool definitions, architecture details, and extension guide.
+Go and Python have full Tree-sitter grammar support. JavaScript, TypeScript, and Rust have file detection but grammar integration is in progress.
 
---NOTES--
-You will need a local embedding model for the search function to work. I used CodeRankReview 160M Q8 ONNX. I am formulating a plan on how to automate it's deployment for those who wish to use it, while providing proper attribution.
+Adding a language: register the Tree-sitter grammar in `internal/parser/parser.go`, add top-level node types, and add the file extension in `internal/crawler/`.
+
+## Further reading
+
+See [DOCUMENTATION.md](DOCUMENTATION.md) for the full command reference, HTTP API endpoints, MCP tool definitions, data model, GUI internals, and extension guide.

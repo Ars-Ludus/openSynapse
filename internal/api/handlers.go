@@ -130,6 +130,15 @@ func (s *Server) getDependents(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) listPatterns(w http.ResponseWriter, r *http.Request) {
+	patterns, err := s.svc.ListPatterns(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"patterns": patterns})
+}
+
 func (s *Server) reindex(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Path string `json:"path"`

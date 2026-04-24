@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/Ars-Ludus/providertron/capability"
 )
 
 // Embedder produces a fixed-dimension vector representation for a text string.
@@ -220,6 +222,48 @@ func (l *LocalEmbedder) EmbedQuery(ctx context.Context, text string) ([]float32,
 		return nil, fmt.Errorf("local embedder: empty response")
 	}
 	return result.Embeddings[0], nil
+}
+
+// ── ProviderEmbedder ──────────────────────────────────────────────────────────
+
+// ProviderEmbedder adapts a capability.Embedder (from providertron) to the
+// internal Embedder interface. Vectors are converted from []float64 to []float32.
+// EmbedBatch loops over single-item calls since capability.Embedder has no
+// batch method.
+type ProviderEmbedder struct {
+	emb capability.Embedder
+	dim int
+}
+
+// NewProviderEmbedder wraps a providertron capability.Embedder.
+func NewProviderEmbedder(emb capability.Embedder, dim int) *ProviderEmbedder {
+	return &ProviderEmbedder{emb: emb, dim: dim}
+}
+
+func (p *ProviderEmbedder) Dimension() int { return p.dim }
+
+func (p *ProviderEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
+	resp, err := p.emb.Embed(ctx, capability.EmbedRequest{Input: text})
+	if err != nil {
+		return nil, fmt.Errorf("provider embedder: %w", err)
+	}
+	out := make([]float32, len(resp.Vector))
+	for i, v := range resp.Vector {
+		out[i] = float32(v)
+	}
+	return out, nil
+}
+
+func (p *ProviderEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	out := make([][]float32, len(texts))
+	for i, t := range texts {
+		v, err := p.Embed(ctx, t)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = v
+	}
+	return out, nil
 }
 
 // ── Factory ───────────────────────────────────────────────────────────────────

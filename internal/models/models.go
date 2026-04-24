@@ -15,6 +15,7 @@ const (
 	LangJavaScript Language = "javascript"
 	LangTypeScript Language = "typescript"
 	LangRust       Language = "rust"
+	LangExternal   Language = "external" // synthetic entries for stdlib/third-party libs
 	LangUnknown    Language = "unknown"
 )
 
@@ -40,6 +41,7 @@ const (
 	SnippetInterface SnippetType = "interface"
 	SnippetVariable  SnippetType = "variable"
 	SnippetConstant  SnippetType = "constant"
+	SnippetExternal  SnippetType = "external" // synthetic entry for a library symbol
 	SnippetUnknown   SnippetType = "unknown"
 )
 
@@ -52,20 +54,48 @@ type CodeFile struct {
 	Language     Language  `db:"language"`
 	FileSize     int64     `db:"file_size"`
 	LastModified time.Time `db:"last_modified"`
+	ContentHash  string    `db:"content_hash"` // SHA-256 of file content
+}
+
+// SnippetMetadata holds control-flow and structural metadata extracted from the AST.
+type SnippetMetadata struct {
+	ReturnsError    bool   `json:"returns_error,omitempty"`
+	EarlyReturns    int    `json:"early_returns,omitempty"`
+	BranchCount     int    `json:"branch_count,omitempty"`     // if/switch/select statements
+	GoroutineSpawns int    `json:"goroutine_spawns,omitempty"` // go keyword
+	ChannelOps      int    `json:"channel_ops,omitempty"`      // <- operator
+	UsesMutex       bool   `json:"uses_mutex,omitempty"`
+	HasPanic        bool   `json:"has_panic,omitempty"`
+	HasRecover      bool   `json:"has_recover,omitempty"`
+	HasDefer        bool   `json:"has_defer,omitempty"`
+	Receiver        string `json:"receiver,omitempty"`          // Go method receiver type name
+	InterfaceMethods []string `json:"interface_methods,omitempty"` // method names for interface types
 }
 
 // Snippet is an atomic, semantically coherent code unit extracted from an AST (Table 2).
 type Snippet struct {
-	SnippetID   uuid.UUID   `db:"snippet_id"`
-	FileID      uuid.UUID   `db:"file_id"`
-	LineStart   int         `db:"line_start"`
-	LineEnd     int         `db:"line_end"`
-	Wikilinks   []string    `db:"wikilinks"` // symbol names referenced
-	RawContent  string      `db:"raw_content"`
-	Description string      `db:"description"`
-	Embedding   []float32   `db:"embedding"`
-	SnippetType SnippetType `db:"snippet_type"`
+	SnippetID        uuid.UUID       `db:"snippet_id"`
+	FileID           uuid.UUID       `db:"file_id"`
+	LineStart        int             `db:"line_start"`
+	LineEnd          int             `db:"line_end"`
+	Wikilinks        []string        `db:"wikilinks"` // symbol names referenced
+	RawContent       string          `db:"raw_content"`
+	Description      string          `db:"description"`
+	Embedding        []float32       `db:"embedding"`
+	SnippetType      SnippetType     `db:"snippet_type"`
+	Name             string          `db:"name"`
+	Metadata         SnippetMetadata `db:"metadata"`
+	CallChainSummary string          `db:"call_chain_summary"`
+}
+
+// Pattern represents a detected structural or behavioral pattern across multiple snippets.
+type Pattern struct {
+	PatternID   uuid.UUID   `db:"pattern_id"`
 	Name        string      `db:"name"`
+	Description string      `db:"description"`
+	PatternType string      `db:"pattern_type"` // "fan_out", "naming", "signature"
+	SnippetIDs  []uuid.UUID `db:"-"`            // populated from join table
+	Embedding   []float32   `db:"embedding"`
 }
 
 // Edge encodes a directed reference relationship between two snippets (Table 3).
